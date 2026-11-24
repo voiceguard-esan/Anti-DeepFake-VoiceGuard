@@ -5,3 +5,5 @@
 **/*.onnx
 
 tests/dataset_test/
+
+backend/VoiceGuardApi/data/

@@ -1,4 +1,6 @@
 using System.Buffers.Binary;
+using System.Threading.RateLimiting;
+using Microsoft.AspNetCore.Authentication.Cookies;
 using Microsoft.ML.OnnxRuntime;
 using Microsoft.ML.OnnxRuntime.Tensors;
 
@@ -8,14 +10,58 @@ var origins = builder.Configuration.GetSection("Cors:Origins").Get<string[]>()
 builder.Services.AddCors(options => options.AddDefaultPolicy(policy =>
     policy.WithOrigins(origins).AllowAnyMethod().AllowAnyHeader()));
 
+var dbPath = Path.GetFullPath(builder.Configuration["VoiceGuard:DatabasePath"] ??
+    Path.Combine(builder.Environment.ContentRootPath, "data", "voiceguard.db"));
+builder.Services.AddSingleton(new AccountStore(dbPath));
+builder.Services.AddAuthentication(CookieAuthenticationDefaults.AuthenticationScheme).AddCookie(options =>
+{
+    options.Cookie.Name = "VoiceGuard.Session";
+    options.Cookie.HttpOnly = true;
+    options.Cookie.SameSite = SameSiteMode.Strict;
+    options.Cookie.SecurePolicy = CookieSecurePolicy.SameAsRequest;
+    options.ExpireTimeSpan = TimeSpan.FromHours(8);
+    options.Events.OnRedirectToLogin = context =>
+    {
+        context.Response.StatusCode = StatusCodes.Status401Unauthorized;
+        return Task.CompletedTask;
+    };
+    options.Events.OnRedirectToAccessDenied = context =>
+    {
+        context.Response.StatusCode = StatusCodes.Status403Forbidden;
+        return Task.CompletedTask;
+    };
+});
+builder.Services.AddAuthorization();
+builder.Services.AddRateLimiter(options =>
+{
+    options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+    options.AddPolicy("accounts", context => RateLimitPartition.GetFixedWindowLimiter(
+        context.Connection.RemoteIpAddress?.ToString() ?? "unknown",
+        _ => new FixedWindowRateLimiterOptions
+        {
+            PermitLimit = 12, Window = TimeSpan.FromMinutes(1)
+        }));
+});
+
 var app = builder.Build();
 app.UseCors();
+app.Use(async (context, next) =>
+{
+    if (context.Request.Path.StartsWithSegments("/api/cuenta")
+        || context.Request.Path.StartsWithSegments("/api/historial"))
+        context.Response.Headers.CacheControl = "no-store";
+    await next(context);
+});
+app.UseAuthentication();
+app.UseAuthorization();
+app.UseRateLimiter();
+app.MapAccounts();
 var modelPath = Path.Combine(AppContext.BaseDirectory, "modelo.onnx");
 using var session = File.Exists(modelPath) ? new InferenceSession(modelPath) : null;
 
 app.MapGet("/api/estado", () => Results.Ok(new { modeloDisponible = session is not null }));
 
-app.MapPost("/api/analisis", async (HttpRequest request) =>
+app.MapPost("/api/analisis", async (HttpRequest request, AccountStore store) =>
 {
     if (!request.HasFormContentType)
         return Results.BadRequest(new { error = "Adjunta un archivo WAV." });
@@ -57,10 +103,14 @@ app.MapPost("/api/analisis", async (HttpRequest request) =>
             return Results.Json(new { error = "El modelo devolvió un resultado inválido." }, statusCode: 503);
 
         var probability = 1.0 / (1.0 + Math.Exp(-logit));
+        var label = probability >= 0.5 ? "real" : "sintetica";
+        var confidence = Math.Round(Math.Max(probability, 1 - probability), 2);
+        if (AccountEndpoints.UserId(request.HttpContext.User) is { } userId)
+            store.Add(userId, file.FileName, label, confidence);
         return Results.Ok(new
         {
-            resultado = probability >= 0.5 ? "real" : "sintetica",
-            confianza = Math.Round(Math.Max(probability, 1 - probability), 2),
+            resultado = label,
+            confianza = confidence,
             mensaje = "Análisis ejecutado mediante OnnxRuntime en C#"
         });
     }
