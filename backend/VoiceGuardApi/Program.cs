@@ -2,7 +2,7 @@ using System.Buffers.Binary;
 using System.Threading.RateLimiting;
 using Microsoft.AspNetCore.Authentication.Cookies;
 using Microsoft.ML.OnnxRuntime;
-using Microsoft.ML.OnnxRuntime.Tensors;
+using System.Security.Cryptography;
 
 var builder = WebApplication.CreateBuilder(args);
 var origins = builder.Configuration.GetSection("Cors:Origins").Get<string[]>()
@@ -56,10 +56,28 @@ app.UseAuthentication();
 app.UseAuthorization();
 app.UseRateLimiter();
 app.MapAccounts();
-var modelPath = Path.Combine(AppContext.BaseDirectory, "modelo.onnx");
+const string modelName = "modelo_cnn_audio.onnx";
+var modelPath = Path.Combine(AppContext.BaseDirectory, modelName);
+string? modelHash = null;
+if (File.Exists(modelPath))
+{
+    using var modelStream = File.OpenRead(modelPath);
+    modelHash = Convert.ToHexString(SHA256.HashData(modelStream)).ToLowerInvariant();
+}
 using var session = File.Exists(modelPath) ? new InferenceSession(modelPath) : null;
 
-app.MapGet("/api/estado", () => Results.Ok(new { modeloDisponible = session is not null }));
+if (session is not null && (!session.InputMetadata.TryGetValue("input_spectrogram", out var metadata)
+    || metadata.ElementType != typeof(float)
+    || !metadata.Dimensions.Skip(1).SequenceEqual(new[] { MelSpectrogram.Bands, MelSpectrogram.Frames, 1 })
+    || !session.OutputMetadata.ContainsKey("output")))
+    throw new InvalidOperationException("El archivo ONNX no corresponde al contrato de la CNN 2D.");
+
+app.MapGet("/api/estado", () => Results.Ok(new
+{
+    modeloDisponible = session is not null,
+    modelo = session is null ? null : modelName,
+    sha256 = modelHash
+}));
 
 app.MapPost("/api/analisis", async (HttpRequest request, AccountStore store) =>
 {
@@ -95,15 +113,14 @@ app.MapPost("/api/analisis", async (HttpRequest request, AccountStore store) =>
 
     try
     {
-        var input = NamedOnnxValue.CreateFromTensor(session.InputMetadata.Keys.Single(),
-            new DenseTensor<float>(samples, new[] { 1, samples.Length }));
+        var input = NamedOnnxValue.CreateFromTensor("input_spectrogram",
+            MelSpectrogram.Transform(samples));
         using var results = session.Run(new[] { input });
-        var logit = results.Single().AsEnumerable<float>().Single();
-        if (!float.IsFinite(logit))
+        var probability = results.Single(value => value.Name == "output").AsEnumerable<float>().Single();
+        if (!float.IsFinite(probability) || probability is < 0 or > 1)
             return Results.Json(new { error = "El modelo devolvió un resultado inválido." }, statusCode: 503);
 
-        var probability = 1.0 / (1.0 + Math.Exp(-logit));
-        var label = probability >= 0.5 ? "real" : "sintetica";
+        var label = probability >= 0.5 ? "sintetica" : "real";
         var confidence = Math.Round(Math.Max(probability, 1 - probability), 2);
         if (AccountEndpoints.UserId(request.HttpContext.User) is { } userId)
             store.Add(userId, file.FileName, label, confidence);
@@ -111,7 +128,7 @@ app.MapPost("/api/analisis", async (HttpRequest request, AccountStore store) =>
         {
             resultado = label,
             confianza = confidence,
-            mensaje = "Análisis ejecutado mediante OnnxRuntime en C#"
+            mensaje = "Análisis ejecutado mediante OnnxRuntime en C#", modelo = modelName
         });
     }
     catch (OnnxRuntimeException ex)
@@ -154,13 +171,15 @@ static float[]? ReadWav(byte[] bytes)
     if (channels is < 1 or > 2 || rate is < 8000 or > 96000 || data.Length < rate * channels * 2)
         return null;
 
-    var samples = new float[16000];
+    var samples = new float[MelSpectrogram.SampleCount];
+    int availableFrames = data.Length / (channels * 2);
     for (int index = 0; index < samples.Length; index++)
     {
-        double position = (double)index * rate / samples.Length;
+        double position = (double)index * rate / MelSpectrogram.SampleRate;
         int frame = (int)position;
+        if (frame >= availableFrames) break;
         var first = ReadFrame(data, frame, channels);
-        var next = ReadFrame(data, Math.Min(frame + 1, rate - 1), channels);
+        var next = ReadFrame(data, Math.Min(frame + 1, availableFrames - 1), channels);
         samples[index] = first + (next - first) * (float)(position - frame);
     }
 
