@@ -1,118 +1,126 @@
+using System.Buffers.Binary;
 using Microsoft.ML.OnnxRuntime;
 using Microsoft.ML.OnnxRuntime.Tensors;
 
 var builder = WebApplication.CreateBuilder(args);
-
-builder.Services.AddCors(options =>
-{
-    options.AddPolicy("AllowAll", policy =>
-    {
-        policy.AllowAnyOrigin().AllowAnyMethod().AllowAnyHeader();
-    });
-});
+var origins = builder.Configuration.GetSection("Cors:Origins").Get<string[]>()
+    ?? ["http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:4173"];
+builder.Services.AddCors(options => options.AddDefaultPolicy(policy =>
+    policy.WithOrigins(origins).AllowAnyMethod().AllowAnyHeader()));
 
 var app = builder.Build();
-app.UseCors("AllowAll");
-
-// 1. Cargar la sesión del modelo ONNX al iniciar la API
+app.UseCors();
 var modelPath = Path.Combine(AppContext.BaseDirectory, "modelo.onnx");
-InferenceSession? session = null;
+using var session = File.Exists(modelPath) ? new InferenceSession(modelPath) : null;
 
-if (File.Exists(modelPath))
-{
-    session = new InferenceSession(modelPath);
-    Console.WriteLine("--> [ONNX] Modelo cargado exitosamente.");
-}
-else
-{
-    Console.WriteLine($"--> [AVISO] No se encontró {modelPath}. Se usará modo fallback.");
-}
+app.MapGet("/api/estado", () => Results.Ok(new { modeloDisponible = session is not null }));
 
 app.MapPost("/api/analisis", async (HttpRequest request) =>
 {
-    if (!request.HasFormContentType || !request.Form.Files.Any())
+    if (!request.HasFormContentType)
+        return Results.BadRequest(new { error = "Adjunta un archivo WAV." });
+
+    IFormCollection form;
+    try
     {
-        return Results.BadRequest(new { error = "No se adjuntó ningún archivo de audio." });
+        form = await request.ReadFormAsync(request.HttpContext.RequestAborted);
+    }
+    catch (InvalidDataException)
+    {
+        return Results.BadRequest(new { error = "El formulario de audio no es válido." });
     }
 
-    var audioFile = request.Form.Files[0];
+    if (form.Files.Count != 1)
+        return Results.BadRequest(new { error = "Adjunta exactamente un archivo WAV." });
 
-    // Validar extensión
-    if (Path.GetExtension(audioFile.FileName).ToLowerInvariant() != ".wav")
+    var file = form.Files[0];
+    if (!string.Equals(Path.GetExtension(file.FileName), ".wav", StringComparison.OrdinalIgnoreCase))
+        return Results.BadRequest(new { error = "Solo se admiten archivos WAV." });
+    if (file.Length > 1024 * 1024)
+        return Results.BadRequest(new { error = "El archivo supera el límite de 1 MB." });
+
+    using var buffer = new MemoryStream();
+    await file.CopyToAsync(buffer, request.HttpContext.RequestAborted);
+    var samples = ReadWav(buffer.ToArray());
+    if (samples is null)
+        return Results.BadRequest(new { error = "Se requiere audio WAV PCM de 16 bits, mono o estéreo, de al menos un segundo." });
+    if (session is null)
+        return Results.Json(new { error = "El modelo de voz no está disponible." }, statusCode: 503);
+
+    try
     {
-        return Results.BadRequest(new { error = "Solo se admiten archivos .wav." });
-    }
+        var input = NamedOnnxValue.CreateFromTensor(session.InputMetadata.Keys.Single(),
+            new DenseTensor<float>(samples, new[] { 1, samples.Length }));
+        using var results = session.Run(new[] { input });
+        var logit = results.Single().AsEnumerable<float>().Single();
+        if (!float.IsFinite(logit))
+            return Results.Json(new { error = "El modelo devolvió un resultado inválido." }, statusCode: 503);
 
-    // Validar tamaño máximo de 1 MB (HU-02 / BUG-04)
-    const long maxBytes = 1024 * 1024;
-    if (audioFile.Length > maxBytes)
-    {
-        return Results.BadRequest(new { error = "El archivo supera el tamaño máximo permitido de 1 MB." });
-    }
-
-    // Leer bytes del archivo de audio
-    using var ms = new MemoryStream();
-    await audioFile.CopyToAsync(ms);
-    var audioBytes = ms.ToArray();
-
-    string etiquetaFinal = "sintetica";
-    float confianzaFinal = 0.88f;
-
-    // 2. Inferencia con ONNX
-    if (session != null && audioBytes.Length > 44)
-    {
-        try
+        var probability = 1.0 / (1.0 + Math.Exp(-logit));
+        return Results.Ok(new
         {
-            // Convertir muestras PCM (16-bit) a float normalizado [-1.0, 1.0]
-            int sampleCount = (audioBytes.Length - 44) / 2;
-            int maxSamples = Math.Min(sampleCount, 16000); // 1 segundo
-            var floatAudio = new float[maxSamples];
-
-            for (int i = 0; i < maxSamples; i++)
-            {
-                short sample = BitConverter.ToInt16(audioBytes, 44 + (i * 2));
-                floatAudio[i] = sample / 32768.0f;
-            }
-
-            // Crear tensor de entrada
-            var inputTensor = new DenseTensor<float>(floatAudio, new[] { 1, maxSamples });
-            var inputName = session.InputMetadata.Keys.First();
-
-            var inputs = new List<NamedOnnxValue>
-            {
-                NamedOnnxValue.CreateFromTensor(inputName, inputTensor)
-            };
-
-            // Ejecutar inferencia
-            using var results = session.Run(inputs);
-            var output = results.First().AsEnumerable<float>().ToArray();
-
-            float rawScore = output[0];
-            float confianzaNormalizada = 1.0f / (1.0f + (float)Math.Exp(-rawScore));
-
-            if (confianzaNormalizada >= 0.5f)
-            {
-                etiquetaFinal = "real";
-                confianzaFinal = confianzaNormalizada;
-            }
-            else
-            {
-                etiquetaFinal = "sintetica";
-                confianzaFinal = 1.0f - confianzaNormalizada;
-            }
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"Error en inferencia ONNX: {ex.Message}");
-        }
+            resultado = probability >= 0.5 ? "real" : "sintetica",
+            confianza = Math.Round(Math.Max(probability, 1 - probability), 2),
+            mensaje = "Análisis ejecutado mediante OnnxRuntime en C#"
+        });
     }
-    Console.WriteLine($"--> [API] Audio recibido ({audioBytes.Length} bytes) | Resultado: {etiquetaFinal} ({Math.Round(confianzaFinal, 2)})");
-    return Results.Ok(new
+    catch (OnnxRuntimeException ex)
     {
-        resultado = etiquetaFinal,
-        confianza = Math.Round(confianzaFinal, 2),
-        mensaje = "Análisis ejecutado mediante OnnxRuntime en C#"
-    });
+        app.Logger.LogError(ex, "Falló la inferencia ONNX.");
+        return Results.Json(new { error = "No se pudo ejecutar el modelo." }, statusCode: 503);
+    }
 });
 
-app.Run("http://0.0.0.0:5000");
+app.Run(app.Configuration["urls"] ?? "http://localhost:5000");
+
+static float[]? ReadWav(byte[] bytes)
+{
+    var wav = bytes.AsSpan();
+    if (wav.Length < 12 || !wav[..4].SequenceEqual("RIFF"u8) || !wav[8..12].SequenceEqual("WAVE"u8))
+        return null;
+
+    ReadOnlySpan<byte> format = default;
+    ReadOnlySpan<byte> data = default;
+    for (int offset = 12; offset <= wav.Length - 8;)
+    {
+        var id = wav.Slice(offset, 4);
+        int size = BinaryPrimitives.ReadInt32LittleEndian(wav[(offset + 4)..]);
+        offset += 8;
+        if (size < 0 || size > wav.Length - offset)
+            return null;
+        if (id.SequenceEqual("fmt "u8))
+            format = wav.Slice(offset, size);
+        if (id.SequenceEqual("data"u8))
+            data = wav.Slice(offset, size);
+        offset += size + (size & 1);
+    }
+
+    if (format.Length < 16 || BinaryPrimitives.ReadUInt16LittleEndian(format) != 1
+        || BinaryPrimitives.ReadUInt16LittleEndian(format[14..]) != 16)
+        return null;
+
+    int channels = BinaryPrimitives.ReadUInt16LittleEndian(format[2..]);
+    int rate = BinaryPrimitives.ReadInt32LittleEndian(format[4..]);
+    if (channels is < 1 or > 2 || rate is < 8000 or > 96000 || data.Length < rate * channels * 2)
+        return null;
+
+    var samples = new float[16000];
+    for (int index = 0; index < samples.Length; index++)
+    {
+        double position = (double)index * rate / samples.Length;
+        int frame = (int)position;
+        var first = ReadFrame(data, frame, channels);
+        var next = ReadFrame(data, Math.Min(frame + 1, rate - 1), channels);
+        samples[index] = first + (next - first) * (float)(position - frame);
+    }
+
+    return samples;
+}
+
+static float ReadFrame(ReadOnlySpan<byte> data, int frame, int channels)
+{
+    int sum = 0;
+    for (int channel = 0; channel < channels; channel++)
+        sum += BinaryPrimitives.ReadInt16LittleEndian(data[((frame * channels + channel) * 2)..]);
+    return sum / (channels * 32768f);
+}
