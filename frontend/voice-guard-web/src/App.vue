@@ -11,6 +11,7 @@ const error = ref('')
 const historyError = ref('')
 const busy = ref(false)
 const status = ref('Comprobando conexión')
+const modelName = ref('')
 const filter = ref('todos')
 const confirmClear = ref(false)
 const history = ref([])
@@ -132,10 +133,12 @@ async function checkStatus() {
   try {
     const response = await fetch(api + '/estado', { signal: AbortSignal.timeout(5000) })
     if (!response.ok) throw new Error()
-    const { modeloDisponible } = await response.json()
+    const { modeloDisponible, modelo } = await response.json()
+    modelName.value = modelo ?? ''
     status.value = modeloDisponible ? 'Modelo disponible' : 'Modelo sin cargar'
   } catch {
     status.value = 'API sin conexión'
+    modelName.value = ''
   }
 }
 
@@ -250,6 +253,7 @@ function exportHistory() {
 
       <section class="panel result" aria-live="polite">
         <h2>Diagnóstico</h2>
+        <small v-if="modelName">Modelo activo: {{ modelName }}</small>
         <div v-if="busy" class="placeholder">Procesando la grabación…</div>
         <div v-else-if="result" class="diagnosis" :class="result.resultado">
           <p class="classification">{{ label(result.resultado) }}</p>
