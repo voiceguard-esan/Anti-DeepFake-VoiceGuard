@@ -1,0 +1,38 @@
+name: Verificacion VoiceGuard
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verificacion:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/voice-guard-web/package-lock.json
+      - name: Compilar API
+        run: dotnet build backend/VoiceGuardApi -c Release --nologo
+      - name: Compilar web
+        working-directory: frontend/voice-guard-web
+        run: |
+          npm ci
+          npm run build
+      - name: Comprobar arranque sin modelo y acceso privado
+        env:
+          VoiceGuard__DatabasePath: /tmp/voiceguard-ci.db
+        run: |
+          dotnet run --no-build -c Release --no-launch-profile --project backend/VoiceGuardApi > /tmp/voiceguard-ci.log 2>&1 &
+          api=$!
+          trap 'kill "$api" 2>/dev/null || true; cat /tmp/voiceguard-ci.log' EXIT
+          curl --fail --silent --show-error --retry 15 --retry-connrefused --retry-delay 1             http://localhost:5000/api/estado | python3 -c 'import json, sys; assert json.load(sys.stdin)["modeloDisponible"] is False'
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:5000/api/historial)" = 401
